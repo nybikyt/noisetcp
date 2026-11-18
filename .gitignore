@@ -1,2 +1,4 @@
 /target/
 /.tooling/
+__pycache__/
+*.pyc
