@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Accept-and-close TCP listener for `noisytcp --mode tw`.
+"""Accept-and-close TCP listener for targets with `tcp_syncookies=2`.
 
-TIME_WAIT recycling needs the peer to complete the handshake and then close,
-so the tuple ends in TIME_WAIT on the target. A stock server keeps the
-connection open or sends a response; this one sends FIN immediately after
-accept(), which is exactly the state the tw choreography expects.
+noisytcp switches to TIME_WAIT mode automatically when it detects that the
+target answers every SYN with a cookie.  Such a target must accept the
+completed connection and close it immediately, which is exactly the state the
+TIME_WAIT choreography expects.
 
     python3 lab/close-listener.py --port 9000
 

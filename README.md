@@ -15,29 +15,39 @@ context, and reallocates the same slab slot through a valid cookie ACK.
 > attributable source address; it does not scan, spread, spoof third parties,
 > or evade detection.
 
-## Status
+## Usage
 
-Implemented:
+```sh
+sudo ./target/release/noisytcp <TARGET_IP> <TARGET_PORT>
+```
 
-* IPv4 request-queue path with `probe`, `verify`, `race` modes;
-* `tw` (TIME_WAIT recycle) mode for targets with `tcp_syncookies=2`;
-* automatic SYN-queue calibration, SYN-queue modelling and cookie harvest;
-* fragment-based RX-context steering with a working-split probe;
-* host-RST leak detection and a temporary `iptables` OUTPUT filter, or
-  ARP-claimed `--spoof` source on an on-link segment;
-* built-in liveness watcher (`TARGET DOWN` → exit code 3);
-* offline `--selftest` (works on any OS, no root) and `--dry-run`.
+That is the whole public interface. Everything else is automatic:
 
-Not implemented: IPv6, full child-socket ABA. `tw` covers the hardened
-`tcp_syncookies=2` case, not IPv6.
+* source address/interface selection, RST-leak detection and the temporary
+  `iptables` OUTPUT rule that keeps the local kernel from resetting the
+  probe's SYN-ACKs;
+* `probe` (fragment path and listener), `verify` (cookie cycle) and SYN-queue
+  calibration before the race;
+* source-port range, fragment split, payload, gaps, jitter and SYN-ACK
+  timeout;
+* one tuple per round, with automatic SYN-queue fill and timings;
+* the liveness watcher: when the target stops answering, the run stops with
+  exit code 3;
+* automatic TIME_WAIT mode when the target answers every SYN with a cookie
+  (`net.ipv4.tcp_syncookies=2`). Such a target needs a listener that accepts
+  and closes immediately, for example `lab/close-listener.py`.
+
+The race runs until the target goes down or you press Ctrl+C. A real kernel
+panic is the only confirmation; the tool cannot know whether the target's
+kernel has the fix.
 
 ## Requirements
 
 Attacker host:
 
 * Linux with IPv4 raw sockets and `AF_PACKET`;
-* `root` or `CAP_NET_RAW` (plus `CAP_NET_ADMIN` for the automatic
-  `iptables` rule and `SO_MARK`);
+* `root` or `CAP_NET_RAW`, plus `CAP_NET_ADMIN` and `iptables` for the
+  automatic RST-suppression rule and `SO_MARK`;
 * a route to the target port, and a path that does not filter or reassemble
   IPv4 fragments before they reach the target.
 
@@ -46,7 +56,8 @@ Target:
 * a Linux kernel **without** fix `4e2b3ef19e0e` ("inet: reject unhashed
   sockets during established lookups");
 * any listening TCP socket (nginx, sshd, a plain `listen()`);
-* `net.ipv4.tcp_syncookies = 1` for `race` (default), or `2` for `tw`;
+* `net.ipv4.tcp_syncookies = 1` (default) — or `2` with a listener that
+  accepts and closes immediately (the tool switches to TIME_WAIT mode);
 * at least two RX queues on the ingress NIC, or RPS enabled, so a fragmented
   packet and a plain packet for the same tuple are processed concurrently.
 
@@ -54,42 +65,26 @@ Target:
 
 ```sh
 cargo build --release
-cargo test                 # packet builders: checksums, framing, fragments
-./target/release/noisytcp --selftest
-./target/release/noisytcp --dry-run
+cargo test
 ```
 
-`--selftest` and the unit tests are pure userspace computation and run on any
-platform with a Rust toolchain. The engine itself is Linux-only.
+`cargo test` covers TCP/IP checksums, MSS framing, fragment reassembly,
+the receive-filter program and CLI validation; it needs no root and no
+network. The engine itself is Linux-only.
 
-## Quick start
+## Exit codes
 
-```sh
-# everything: probe, verify, calibrate, then race until Ctrl+C
-sudo ./target/release/noisytcp 192.168.1.100 22
-
-# diagnostics only
-sudo ./target/release/noisytcp 192.168.1.100 22 --mode probe
-sudo ./target/release/noisytcp 192.168.1.100 22 --mode verify
-
-# fixed queue geometry, ten minutes
-sudo ./target/release/noisytcp 192.168.1.100 22 --backlog 128 --batch 128 --duration 600
-
-# hardened target: tcp_syncookies=2 and a listener that closes on accept
-sudo ./target/release/noisytcp 192.168.1.100 9000 --mode tw
-
-# no local RSTs and no iptables: claim a free address on the segment
-sudo ./target/release/noisytcp 192.168.1.100 22 --spoof --src 192.168.1.77
-```
-
-Exit codes: `0` run finished, `1` runtime/preflight error, `2` invalid
-arguments, `3` the liveness watcher declared the target down.
+| Code | Meaning |
+| --- | --- |
+| 0 | run finished (duration/Ctrl+C) without a DOWN verdict |
+| 1 | runtime/preflight error |
+| 2 | invalid arguments |
+| 3 | the liveness watcher declared the target down |
 
 ## Documentation
 
-The full manual (modes, every option, packet choreography, tuning,
-troubleshooting, TIME_WAIT mode, debug hooks) is in
-[ИНСТРУКЦИЯ.txt](ИНСТРУКЦИЯ.txt) (Russian). `--help` lists the CLI surface.
+The Russian manual is [ИНСТРУКЦИЯ.txt](ИНСТРУКЦИЯ.txt). `--help` shows the
+two positional arguments.
 
 ## Credits
 
@@ -104,6 +99,6 @@ Reference proof-of-concepts this implementation borrows ideas from:
 * <https://github.com/re4/noisytcp-poc> — fragment steering, out-of-window
   probe, binary-search backlog calibration, TIME_WAIT recycle, ARP claim;
 * <https://github.com/nsvk13/NoisyTCP-PoC> — `sendmmsg` batching, graded
-  fragment-path probe, offline selftest, lab monitor semantics;
+  fragment-path probe, lab monitor semantics;
 * <https://github.com/mustafasaydam/CVE-2026-99288---NoisyTCP-Exploit> —
   in-process liveness watchdog, staged microsecond pacing.

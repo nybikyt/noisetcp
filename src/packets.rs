@@ -1,9 +1,19 @@
-use std::io;
 use std::net::Ipv4Addr;
 
 pub(crate) const PROBE_PAYLOAD_LEN: usize = 40;
 pub(crate) const PROBE_SPLITS: [usize; 4] = [8, 24, 32, 40];
 pub(crate) const DEFAULT_SPLIT: usize = 24;
+
+/// Pick a first-fragment split that fits a race reader segment of
+/// `20 + payload_len` bytes.  Mirrors the preference order of the fragment-path
+/// probe, so `--dry-run` (which cannot probe the path) builds the same shape
+/// the real race would.
+pub(crate) fn default_split(payload_len: usize) -> usize {
+    [DEFAULT_SPLIT, 32, 40, 8]
+        .into_iter()
+        .find(|split| *split < 20 + payload_len)
+        .unwrap_or(8)
+}
 pub(crate) const FLAG_FIN: u8 = 0x01;
 pub(crate) const FLAG_SYN: u8 = 0x02;
 pub(crate) const FLAG_RST: u8 = 0x04;
@@ -102,157 +112,6 @@ fn finish_checksum(mut sum: u32) -> u16 {
     !(sum as u16)
 }
 
-/*
- * --selftest (idea from nsvk13): build every packet type the engine uses
- * with fixed documentation addresses, verify checksums, header fields
- * and fragment framing offline, and dump them. No root, no network.
- */
-pub(crate) fn selftest() -> io::Result<()> {
-    let source = Ipv4Addr::new(192, 0, 2, 1);
-    let target = Ipv4Addr::new(192, 0, 2, 2);
-    let port = 9000u16;
-    let sport = 40000u16;
-    let isn = 0xdead_beefu32;
-
-    let check = |condition: bool, message: &str| -> io::Result<()> {
-        if condition {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!("selftest: {message}")))
-        }
-    };
-    let verify_tcp = |tcp: &[u8]| -> io::Result<()> {
-        let sum = pseudo_header_sum(source, target, tcp.len()) + checksum_sum(tcp);
-        check(finish_checksum(sum) == 0, "TCP checksum does not verify")
-    };
-    let verify_ip = |packet: &[u8]| -> io::Result<()> {
-        check(
-            finish_checksum(checksum_sum(&packet[..20])) == 0,
-            "IPv4 header checksum does not verify",
-        )
-    };
-    let hexdump = |tag: &str, packet: &[u8]| {
-        print!("{tag} ({} bytes):", packet.len());
-        for byte in packet {
-            print!(" {byte:02x}");
-        }
-        println!();
-    };
-
-    // plain SYN with MSS option
-    let syn = tcp_packet(
-        source,
-        target,
-        port,
-        SegmentSpec {
-            source_port: sport,
-            sequence: isn,
-            acknowledgment: 0,
-            flags: FLAG_SYN,
-            mss: 1460,
-            payload_len: 0,
-        },
-    );
-    verify_tcp(&syn)?;
-    check(syn.len() == 24, "SYN length")?;
-    check(syn[12] == 0x60, "SYN data offset")?;
-    check(syn[13] == FLAG_SYN, "SYN flags")?;
-    check(syn[20..24] == [2u8, 4, 0x05, 0xb4], "SYN MSS option")?;
-    let packet = ipv4_packet(source, target, 1, 0, false, &syn);
-    verify_ip(&packet)?;
-    check(packet[6] & 0x20 == 0, "SYN must not set MF")?;
-    hexdump("SYN", &packet);
-
-    // in-window RST
-    let rst = tcp_packet(
-        source,
-        target,
-        port,
-        SegmentSpec {
-            source_port: sport,
-            sequence: isn.wrapping_add(1),
-            acknowledgment: 0,
-            flags: FLAG_RST,
-            mss: 0,
-            payload_len: 0,
-        },
-    );
-    verify_tcp(&rst)?;
-    check(rst.len() == 20 && rst[13] == FLAG_RST, "RST framing")?;
-    let packet = ipv4_packet(source, target, 2, 0, false, &rst);
-    verify_ip(&packet)?;
-    hexdump("RST", &packet);
-
-    // cookie ACK
-    let ack = tcp_packet(
-        source,
-        target,
-        port,
-        SegmentSpec {
-            source_port: sport,
-            sequence: isn.wrapping_add(1),
-            acknowledgment: 0x1234_5679,
-            flags: FLAG_ACK,
-            mss: 0,
-            payload_len: 0,
-        },
-    );
-    verify_tcp(&ack)?;
-    check(
-        u32::from_be_bytes([ack[8], ack[9], ack[10], ack[11]]) == 0x1234_5679,
-        "cookie ACK acknowledgment field",
-    )?;
-    let packet = ipv4_packet(source, target, 3, 0, false, &ack);
-    verify_ip(&packet)?;
-    hexdump("cookie ACK", &packet);
-
-    // fragmented reader at every probe split point
-    for split in PROBE_SPLITS {
-        let reader = tcp_packet(
-            source,
-            target,
-            port,
-            SegmentSpec {
-                source_port: sport,
-                sequence: isn.wrapping_add(1),
-                acknowledgment: 0,
-                flags: FLAG_ACK,
-                mss: 0,
-                payload_len: PROBE_PAYLOAD_LEN,
-            },
-        );
-        verify_tcp(&reader)?;
-        let first = ipv4_packet(source, target, 4, 0, true, &reader[..split]);
-        let second = ipv4_packet(source, target, 4, split, false, &reader[split..]);
-        verify_ip(&first)?;
-        verify_ip(&second)?;
-        check(first[6] & 0x20 != 0, "first fragment must set MF")?;
-        check(
-            u16::from_be_bytes([first[6], first[7]]) & 0x1fff == 0,
-            "first fragment offset must be zero",
-        )?;
-        check(
-            u16::from_be_bytes([second[6], second[7]]) == (split / 8) as u16,
-            "second fragment offset",
-        )?;
-        check(
-            first[4..6] == second[4..6],
-            "fragment pair must share the IP id",
-        )?;
-        let mut reassembled = first[20..].to_vec();
-        reassembled.extend_from_slice(&second[20..]);
-        check(
-            reassembled == reader,
-            "fragments must reassemble to the segment",
-        )?;
-        hexdump(&format!("reader split={split} frag1"), &first);
-        hexdump(&format!("reader split={split} frag2"), &second);
-    }
-
-    println!("selftest ok: checksums, header fields and fragment framing verified");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +198,22 @@ mod tests {
         let without = segment(0, 0);
         assert_eq!(without[12], 0x50);
         assert_eq!(without.len(), 20);
+    }
+
+    #[test]
+    fn default_split_fits_every_payload_shape() {
+        for payload_len in 0usize..=256 {
+            let split = default_split(payload_len);
+            assert!(split >= 8, "payload={payload_len}");
+            assert_eq!(split % 8, 0, "payload={payload_len}");
+            assert!(
+                split < 20 + payload_len,
+                "payload={payload_len} split={split}"
+            );
+        }
+        assert_eq!(default_split(16), 24);
+        assert_eq!(default_split(4), 8);
+        assert_eq!(default_split(0), 8);
     }
 
     #[test]

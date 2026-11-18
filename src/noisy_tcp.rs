@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 mod platform {
     use crate::packets::{
-        ipv4_packet, tcp_packet, SegmentSpec, DEFAULT_SPLIT, FLAG_ACK, FLAG_FIN, FLAG_RST,
+        default_split, ipv4_packet, tcp_packet, SegmentSpec, FLAG_ACK, FLAG_FIN, FLAG_RST,
         FLAG_SYN, PROBE_PAYLOAD_LEN, PROBE_SPLITS,
     };
     use crate::{Config, Mode};
@@ -44,6 +44,9 @@ mod platform {
     }
 
     fn pin_to(cpu: usize) {
+        if cpu >= libc::CPU_SETSIZE as usize {
+            return;
+        }
         unsafe {
             let mut set: libc::cpu_set_t = mem::zeroed();
             libc::CPU_ZERO(&mut set);
@@ -70,6 +73,77 @@ mod platform {
         rounds: u64,
         timeouts: u64,
         rst_leaks: u64,
+    }
+
+    /*
+     * Classic-BPF receive filter: keep TCP segments whose source or destination
+     * port is the target port, plus ARP when spoofing, VLAN frames and IP
+     * fragments.  The authoritative parse and tuple checks live in
+     * handle_frame(); this only cuts sniffer load on busy lab hosts.
+     */
+    fn filter_program(target_port: u16, allow_arp: bool) -> Vec<libc::sock_filter> {
+        fn emit(code: &mut Vec<libc::sock_filter>, c: u16, jt: u8, jf: u8, k: u32) {
+            code.push(libc::sock_filter { code: c, jt, jf, k });
+        }
+        let port = u32::from(target_port);
+        let mut code: Vec<libc::sock_filter> = Vec::new();
+        let ldh_abs = (libc::BPF_LD | libc::BPF_H | libc::BPF_ABS) as u16;
+        let ldb_abs = (libc::BPF_LD | libc::BPF_B | libc::BPF_ABS) as u16;
+        let ldh_ind = (libc::BPF_LD | libc::BPF_H | libc::BPF_IND) as u16;
+        let ldx_msh = (libc::BPF_LDX | libc::BPF_B | libc::BPF_MSH) as u16;
+        let jeq_k = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        let jset_k = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
+        let ret_k = (libc::BPF_RET | libc::BPF_K) as u16;
+        // Layout is fixed; jumps are resolved against the two final
+        // instructions (DROP then PASS) below.
+        // 0: ldh [12]
+        emit(&mut code, ldh_abs, 0, 0, 12);
+        let mut fixups: Vec<(usize, bool)> = Vec::new(); // (index, jump-if-true)
+        if allow_arp {
+            // jeq 0x0806 -> PASS
+            fixups.push((code.len(), true));
+            emit(&mut code, jeq_k, 0, 0, 0x0806);
+        }
+        // jeq 0x8100 -> PASS (VLAN: userspace handles the inner header)
+        fixups.push((code.len(), true));
+        emit(&mut code, jeq_k, 0, 0, 0x8100);
+        // jne 0x0800 -> DROP
+        fixups.push((code.len(), false));
+        emit(&mut code, jeq_k, 0, 0, 0x0800);
+        // ldb [23]; jne IPPROTO_TCP -> DROP
+        emit(&mut code, ldb_abs, 0, 0, 23);
+        fixups.push((code.len(), false));
+        emit(&mut code, jeq_k, 0, 0, u32::from(libc::IPPROTO_TCP as u8));
+        // ldh [20]; jset 0x1fff -> PASS (fragments)
+        emit(&mut code, ldh_abs, 0, 0, 20);
+        fixups.push((code.len(), true));
+        emit(&mut code, jset_k, 0, 0, 0x1fff);
+        // ldx msh [14]; ldh [x+14]; jeq port -> PASS; ldh [x+16]; jeq port -> PASS
+        // X is the IP header length, so the TCP source/destination ports sit at
+        // frame offsets X+14 and X+16.
+        emit(&mut code, ldx_msh, 0, 0, 14);
+        emit(&mut code, ldh_ind, 0, 0, 14);
+        fixups.push((code.len(), true));
+        emit(&mut code, jeq_k, 0, 0, port);
+        emit(&mut code, ldh_ind, 0, 0, 16);
+        fixups.push((code.len(), true));
+        emit(&mut code, jeq_k, 0, 0, port);
+        // DROP must precede PASS: if the final port comparison falls through,
+        // the packet is not ours.
+        let drop_index = code.len();
+        emit(&mut code, ret_k, 0, 0, 0); // DROP
+        let pass_index = code.len();
+        emit(&mut code, ret_k, 0, 0, 65_535); // PASS
+        for (index, on_true) in fixups {
+            let target = if on_true { pass_index } else { drop_index };
+            let offset = (target - index - 1) as u8;
+            if on_true {
+                code[index].jt = offset;
+            } else {
+                code[index].jf = offset;
+            }
+        }
+        code
     }
 
     struct RawSocket {
@@ -193,70 +267,11 @@ mod platform {
         }
 
         /*
-         * Classic-BPF receive filter: keep only TCP segments whose source or
-         * destination port is the target port (plus ARP when spoofing, VLAN
-         * frames and IP fragments, which userspace parses). Cuts the sniffer
-         * load on busy lab hosts; failure to attach is not fatal.
+         * Attach the filter built by filter_program().  Failure is not fatal:
+         * the sniffer then receives every frame and handle_frame filters them.
          */
         fn attach_filter(&self, target_port: u16, allow_arp: bool) {
-            fn emit(code: &mut Vec<libc::sock_filter>, c: u16, jt: u8, jf: u8, k: u32) {
-                code.push(libc::sock_filter { code: c, jt, jf, k });
-            }
-            let port = u32::from(target_port);
-            let mut code: Vec<libc::sock_filter> = Vec::new();
-            let ldh_abs = (libc::BPF_LD | libc::BPF_H | libc::BPF_ABS) as u16;
-            let ldb_abs = (libc::BPF_LD | libc::BPF_B | libc::BPF_ABS) as u16;
-            let ldh_ind = (libc::BPF_LD | libc::BPF_H | libc::BPF_IND) as u16;
-            let ldx_msh = (libc::BPF_LDX | libc::BPF_B | libc::BPF_MSH) as u16;
-            let jeq_k = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
-            let jset_k = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
-            let ret_k = (libc::BPF_RET | libc::BPF_K) as u16;
-            // Layout is fixed; jumps are resolved against the two final
-            // instructions (PASS then DROP) below.
-            // 0: ldh [12]
-            emit(&mut code, ldh_abs, 0, 0, 12);
-            let mut fixups: Vec<(usize, bool)> = Vec::new(); // (index, jump-if-true)
-            if allow_arp {
-                // jeq 0x0806 -> PASS
-                fixups.push((code.len(), true));
-                emit(&mut code, jeq_k, 0, 0, 0x0806);
-            }
-            // jeq 0x8100 -> PASS (VLAN: userspace handles the inner header)
-            fixups.push((code.len(), true));
-            emit(&mut code, jeq_k, 0, 0, 0x8100);
-            // jne 0x0800 -> DROP
-            fixups.push((code.len(), false));
-            emit(&mut code, jeq_k, 0, 0, 0x0800);
-            // ldb [23]; jne IPPROTO_TCP -> DROP
-            emit(&mut code, ldb_abs, 0, 0, 23);
-            fixups.push((code.len(), false));
-            emit(&mut code, jeq_k, 0, 0, u32::from(libc::IPPROTO_TCP as u8));
-            // ldh [20]; jset 0x1fff -> PASS (fragments)
-            emit(&mut code, ldh_abs, 0, 0, 20);
-            fixups.push((code.len(), true));
-            emit(&mut code, jset_k, 0, 0, 0x1fff);
-            // ldx msh [14]; ldh [x+34]; jeq port -> PASS; ldh [x+36]; jeq port -> PASS
-            emit(&mut code, ldx_msh, 0, 0, 14);
-            emit(&mut code, ldh_ind, 0, 0, 34);
-            fixups.push((code.len(), true));
-            emit(&mut code, jeq_k, 0, 0, port);
-            emit(&mut code, ldh_ind, 0, 0, 36);
-            fixups.push((code.len(), true));
-            emit(&mut code, jeq_k, 0, 0, port);
-            // fall through to DROP
-            let drop_index = code.len() + 1;
-            let pass_index = code.len();
-            emit(&mut code, ret_k, 0, 0, 65_535); // PASS
-            emit(&mut code, ret_k, 0, 0, 0); // DROP
-            for (index, on_true) in fixups {
-                let target = if on_true { pass_index } else { drop_index };
-                let offset = (target - index - 1) as u8;
-                if on_true {
-                    code[index].jt = offset;
-                } else {
-                    code[index].jf = offset;
-                }
-            }
+            let code = filter_program(target_port, allow_arp);
             let program = libc::sock_fprog {
                 len: code.len() as u16,
                 filter: code.as_ptr() as *mut libc::sock_filter,
@@ -575,12 +590,16 @@ mod platform {
 
         fn read(&self, port: u16) -> (u64, Segment) {
             let index = usize::from(port);
+            // Read the counter first: the sniffer stores the fields and then
+            // publishes them with a release increment of the counter, so an
+            // acquire load of the counter must happen before the field loads.
+            let count = self.counts[index].load(Ordering::Acquire);
             let segment = Segment {
                 flags: self.flags[index].load(Ordering::Relaxed) as u8,
                 sequence: self.sequences[index].load(Ordering::Relaxed),
                 acknowledgment: self.acknowledgments[index].load(Ordering::Relaxed),
             };
-            (self.counts[index].load(Ordering::Acquire), segment)
+            (count, segment)
         }
     }
 
@@ -1063,7 +1082,9 @@ mod platform {
                 .unwrap_or_default()
                 .as_nanos() as u64
                 ^ u64::from(std::process::id());
-            let resolved_split = config.frag_split.unwrap_or(DEFAULT_SPLIT);
+            let resolved_split = config
+                .frag_split
+                .unwrap_or_else(|| default_split(config.payload));
             Self {
                 config,
                 source,
@@ -1304,22 +1325,16 @@ mod platform {
 
         /*
          * One fragmented SYN at a given split point. The probe segment carries
-         * an MSS option plus PROBE_PAYLOAD_LEN payload bytes so every split in
-         * PROBE_SPLITS is representable. Returns the server ISN on success.
+         * an MSS option plus `payload_len` bytes so every split in PROBE_SPLITS
+         * is representable; a configured split beyond that segment gets a
+         * dedicated, larger probe. Returns the server ISN on success.
          */
-        fn probe_fragment_at(&mut self, split: usize) -> Option<u32> {
+        fn probe_fragment_at(&mut self, split: usize, payload_len: usize) -> Option<u32> {
             let port = self.take_source_port();
             let sequence = self.random_u32();
             let packet_id = self.next_packet_id();
             let mark = self.sniffer.state.mark(port);
-            let tcp = self.build_segment(
-                port,
-                sequence,
-                0,
-                FLAG_SYN,
-                self.config.mss,
-                PROBE_PAYLOAD_LEN,
-            );
+            let tcp = self.build_segment(port, sequence, 0, FLAG_SYN, self.config.mss, payload_len);
             let first = ipv4_packet(
                 self.source,
                 self.config.target,
@@ -1340,16 +1355,12 @@ mod platform {
             self.spin_gap(self.config.frag_gap_us);
             self.transmit(&second);
             let response = self.wait_synack(port, sequence, mark, Duration::from_secs(2));
-            self.send_segment(
-                port,
-                sequence
-                    .wrapping_add(1)
-                    .wrapping_add(PROBE_PAYLOAD_LEN as u32),
-                0,
-                FLAG_RST,
-                false,
-                0,
-            );
+            // A SYN consumes exactly one sequence number even when it carries
+            // data (Linux discards data in a plain SYN), so rcv_nxt is the SYN
+            // sequence plus one.  An RST anywhere else in the receive window
+            // also drops the request, but matching rcv_nxt is the defined
+            // embryonic-reset path and survives stricter RST sequence checks.
+            self.send_segment(port, sequence.wrapping_add(1), 0, FLAG_RST, false, 0);
             response
         }
 
@@ -1363,7 +1374,7 @@ mod platform {
             let mut working: Vec<usize> = Vec::new();
             let mut report = String::new();
             for split in PROBE_SPLITS {
-                let ok = self.probe_fragment_at(split).is_some();
+                let ok = self.probe_fragment_at(split, PROBE_PAYLOAD_LEN).is_some();
                 report.push_str(&format!(" split{split}={}", if ok { "ok" } else { "drop" }));
                 if ok {
                     working.push(split);
@@ -1389,9 +1400,24 @@ mod platform {
                 .collect();
             if let Some(requested) = self.config.frag_split {
                 if !working.contains(&requested) {
-                    return Err(io::Error::other(format!(
-                        "the configured --frag-split {requested} is dropped by the path; working splits: {working:?}"
-                    )));
+                    // The fixed probe only carries PROBE_PAYLOAD_LEN bytes.  A
+                    // larger requested split needs a larger SYN to be
+                    // representable; probe it directly instead of falsely
+                    // reporting that the path drops it.
+                    let header = if self.config.mss != 0 { 24 } else { 20 };
+                    let probe_payload = requested
+                        .saturating_sub(header)
+                        .saturating_add(8)
+                        .max(PROBE_PAYLOAD_LEN);
+                    if self.probe_fragment_at(requested, probe_payload).is_some() {
+                        println!(
+                            "[*] configured --frag-split {requested} verified with a {probe_payload}-byte probe"
+                        );
+                    } else {
+                        return Err(io::Error::other(format!(
+                            "the configured --frag-split {requested} is dropped by the path; working splits: {working:?}"
+                        )));
+                    }
                 }
                 self.resolved_split = requested;
             } else {
@@ -1457,9 +1483,17 @@ mod platform {
                 .saturating_add(10)
                 .clamp(10, 2_000);
             self.synack_timeout = Duration::from_millis(milliseconds);
+            // A slow path needs a longer settle between control phases.  Only
+            // auto-tune when the value is still the built-in default, so an
+            // explicit (hidden QA) --settle-us always wins.
+            if self.config.settle_us == 5_000 {
+                let rtt_us = rtt.as_micros().min(u128::from(u64::MAX)) as u64;
+                self.config.settle_us = rtt_us.saturating_mul(20).clamp(5_000, 50_000);
+            }
             println!(
-                "[*] RTT={:.3} ms, SYN-ACK timeout={milliseconds} ms",
-                rtt.as_secs_f64() * 1000.0
+                "[*] RTT={:.3} ms, SYN-ACK timeout={milliseconds} ms, settle={} us",
+                rtt.as_secs_f64() * 1000.0,
+                self.config.settle_us
             );
             Ok(())
         }
@@ -1531,6 +1565,22 @@ mod platform {
             if self.config.settle_us > 0 {
                 thread::sleep(Duration::from_micros(self.config.settle_us));
             }
+        }
+
+        fn settle_drain(&self) {
+            if self.config.drain_settle_us > 0 {
+                thread::sleep(Duration::from_micros(self.config.drain_settle_us));
+            }
+        }
+
+        fn run_deadline(started: Instant, seconds: u64) -> io::Result<Option<Instant>> {
+            if seconds == 0 {
+                return Ok(None);
+            }
+            started
+                .checked_add(Duration::from_secs(seconds))
+                .map(Some)
+                .ok_or_else(|| invalid_input("--duration is too large"))
         }
 
         fn spin_gap(&mut self, base: u64) {
@@ -1635,7 +1685,7 @@ mod platform {
             if low <= 1 {
                 self.junk_drain_all();
                 return Err(io::Error::other(
-                    "the listener returns cookies immediately (tcp_syncookies=2); use --mode tw for this target",
+                    "the listener returns cookies immediately (tcp_syncookies=2)",
                 ));
             }
             self.calibrated_fill = low;
@@ -1772,7 +1822,9 @@ mod platform {
                 }
                 if let Ok(path) = std::env::var("NOISYTCP_GDB_SYNC") {
                     let path = std::path::Path::new(&path);
-                    let deadline = Instant::now() + Duration::from_secs(5);
+                    // GDB runs with TCG: leave enough time for the host window
+                    // to drain filler lookups before the reader is resumed.
+                    let deadline = Instant::now() + Duration::from_secs(30);
                     while !path.exists() && Instant::now() < deadline {
                         thread::sleep(Duration::from_micros(50));
                     }
@@ -1891,7 +1943,7 @@ mod platform {
             }
 
             self.junk_drain_all();
-            self.settle();
+            self.settle_drain();
             let mut packets = Vec::new();
             for target in &mut targets {
                 if target.cookie.is_none() {
@@ -1976,7 +2028,7 @@ mod platform {
 
             println!("[3/5] freeing one queue slot and creating a hashed request socket");
             self.junk_drain(1);
-            self.settle();
+            self.settle_drain();
             let request_sequence = self.random_u32();
             let mark = self.sniffer.state.mark(port);
             self.send_segment(port, request_sequence, 0, FLAG_SYN, true, 0);
@@ -2106,8 +2158,7 @@ mod platform {
             }
             println!("Ctrl+C to stop; only a target kernel log can confirm the panic");
             let started = Instant::now();
-            let deadline = (self.config.duration != 0)
-                .then(|| started + Duration::from_secs(self.config.duration));
+            let deadline = Self::run_deadline(started, self.config.duration)?;
             let mut next_report = started + Duration::from_secs(5);
             while !STOP.load(Ordering::Acquire) {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -2262,8 +2313,7 @@ mod platform {
             }
             println!("Ctrl+C to stop; only a target kernel log can confirm the panic");
             let started = Instant::now();
-            let deadline = (self.config.duration != 0)
-                .then(|| started + Duration::from_secs(self.config.duration));
+            let deadline = Self::run_deadline(started, self.config.duration)?;
             let mut next_report = started + Duration::from_secs(5);
             while !STOP.load(Ordering::Acquire) {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -2392,7 +2442,16 @@ mod platform {
         match engine.config.mode {
             Mode::Probe => engine.mode_probe(),
             Mode::Verify => engine.mode_verify(),
-            Mode::Race => engine.mode_race(),
+            Mode::Race => match engine.mode_race() {
+                Ok(()) => Ok(()),
+                Err(error) if error.to_string().contains("syncookies=2") => {
+                    println!(
+                        "[*] target answers every SYN with a cookie; retrying in TIME_WAIT mode"
+                    );
+                    engine.mode_tw()
+                }
+                Err(error) => Err(error),
+            },
             Mode::Tw => engine.mode_tw(),
         }
     }
@@ -2414,7 +2473,9 @@ mod platform {
         } else {
             config.batch
         };
-        let split = config.frag_split.unwrap_or(DEFAULT_SPLIT);
+        let split = config
+            .frag_split
+            .unwrap_or_else(|| default_split(config.payload));
         let mut engine = Engine::new(
             config,
             source,
@@ -2516,16 +2577,41 @@ mod platform {
     }
 
     fn interface_mac(name: &str) -> io::Result<[u8; 6]> {
-        let text = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))?;
-        let mut mac = [0u8; 6];
-        for (index, part) in text.trim().split(':').enumerate() {
-            if index >= 6 {
-                break;
+        // Prefer getifaddrs(): sysfs is not namespaced, so /sys/class/net/<if>
+        // can be absent in containers and network namespaces even though the
+        // interface itself exists.
+        unsafe {
+            let mut addresses = ptr::null_mut();
+            if libc::getifaddrs(&mut addresses) != 0 {
+                return Err(io::Error::last_os_error());
             }
-            mac[index] = u8::from_str_radix(part, 16)
-                .map_err(|_| invalid_input(format!("cannot parse MAC address of {name}")))?;
+            let mut current = addresses;
+            let mut result = None;
+            while !current.is_null() {
+                let entry = &*current;
+                if !entry.ifa_addr.is_null()
+                    && (*entry.ifa_addr).sa_family == libc::AF_PACKET as libc::sa_family_t
+                    && CStr::from_ptr(entry.ifa_name).to_bytes() == name.as_bytes()
+                {
+                    let address = &*(entry.ifa_addr as *const libc::sockaddr_ll);
+                    if address.sll_halen >= 6 {
+                        let mut mac = [0u8; 6];
+                        mac.copy_from_slice(&address.sll_addr[..6]);
+                        result = Some(mac);
+                        break;
+                    }
+                }
+                current = entry.ifa_next;
+            }
+            libc::freeifaddrs(addresses);
+            if let Some(mac) = result {
+                return Ok(mac);
+            }
         }
-        Ok(mac)
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot read the MAC address of {name}"),
+        ))
     }
 
     fn interface_name_for_address(source: Ipv4Addr) -> io::Result<String> {
@@ -2586,15 +2672,139 @@ mod platform {
             sin_zero: [0; 8],
         }
     }
+
+    #[cfg(test)]
+    mod filter_tests {
+        use super::filter_program;
+
+        const PASS: u32 = 65_535;
+        const DROP: u32 = 0;
+
+        fn read_u16(frame: &[u8], offset: usize) -> Option<u16> {
+            let bytes = frame.get(offset..offset + 2)?;
+            Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+        }
+
+        // Minimal classic-BPF interpreter with the kernel's out-of-bounds
+        // load behaviour (abort the program and return 0).
+        fn run(code: &[libc::sock_filter], frame: &[u8]) -> u32 {
+            let ld_h_abs = (libc::BPF_LD | libc::BPF_H | libc::BPF_ABS) as u16;
+            let ld_b_abs = (libc::BPF_LD | libc::BPF_B | libc::BPF_ABS) as u16;
+            let ld_h_ind = (libc::BPF_LD | libc::BPF_H | libc::BPF_IND) as u16;
+            let ldx_b_msh = (libc::BPF_LDX | libc::BPF_B | libc::BPF_MSH) as u16;
+            let jmp_jeq_k = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+            let jmp_jset_k = (libc::BPF_JMP | libc::BPF_JSET | libc::BPF_K) as u16;
+            let ret_k = (libc::BPF_RET | libc::BPF_K) as u16;
+            let mut accumulator = 0u32;
+            let mut index = 0usize;
+            let mut pc = 0usize;
+            loop {
+                let Some(insn) = code.get(pc) else {
+                    return DROP;
+                };
+                if insn.code == ld_h_abs {
+                    let Some(value) = read_u16(frame, insn.k as usize) else {
+                        return DROP;
+                    };
+                    accumulator = u32::from(value);
+                    pc += 1;
+                } else if insn.code == ld_b_abs {
+                    let Some(value) = frame.get(insn.k as usize) else {
+                        return DROP;
+                    };
+                    accumulator = u32::from(*value);
+                    pc += 1;
+                } else if insn.code == ldx_b_msh {
+                    let Some(value) = frame.get(insn.k as usize) else {
+                        return DROP;
+                    };
+                    index = usize::from(value & 0x0f) * 4;
+                    pc += 1;
+                } else if insn.code == ld_h_ind {
+                    let Some(value) = read_u16(frame, index + insn.k as usize) else {
+                        return DROP;
+                    };
+                    accumulator = u32::from(value);
+                    pc += 1;
+                } else if insn.code == jmp_jeq_k {
+                    let taken = accumulator == insn.k;
+                    pc += 1 + usize::from(if taken { insn.jt } else { insn.jf });
+                } else if insn.code == jmp_jset_k {
+                    let taken = accumulator & insn.k != 0;
+                    pc += 1 + usize::from(if taken { insn.jt } else { insn.jf });
+                } else if insn.code == ret_k {
+                    return insn.k;
+                } else {
+                    return DROP;
+                }
+            }
+        }
+
+        fn ipv4_tcp(
+            ihl: usize,
+            protocol: u8,
+            source_port: u16,
+            target_port: u16,
+            tcp_len: usize,
+        ) -> Vec<u8> {
+            let mut frame = vec![0u8; 14 + ihl + tcp_len];
+            frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+            frame[14] = 0x40 | ((ihl / 4) as u8);
+            frame[23] = protocol; // frame[14 + 9]
+            let tcp = 14 + ihl;
+            frame[tcp..tcp + 2].copy_from_slice(&source_port.to_be_bytes());
+            frame[tcp + 2..tcp + 4].copy_from_slice(&target_port.to_be_bytes());
+            frame[tcp + 12] = ((tcp_len / 4) as u8) << 4;
+            frame
+        }
+
+        #[test]
+        fn filter_passes_bare_acks_and_rsts_for_the_target_port() {
+            let filter = filter_program(9000, false);
+            // SYN-ACK with options: the shape that worked even with the old
+            // offset bug.
+            assert_eq!(run(&filter, &ipv4_tcp(20, 6, 9000, 40000, 32)), PASS);
+            // Bare ACK/RST: no options, so the old x+34 load was out of bounds
+            // and the kernel dropped these.  Challenge ACKs and host-RST leak
+            // detection depend on them.
+            assert_eq!(run(&filter, &ipv4_tcp(20, 6, 9000, 40000, 20)), PASS);
+            assert_eq!(run(&filter, &ipv4_tcp(20, 6, 40000, 9000, 20)), PASS);
+            // IP options shift the TCP header.
+            assert_eq!(run(&filter, &ipv4_tcp(24, 6, 9000, 40000, 20)), PASS);
+        }
+
+        #[test]
+        fn filter_drops_other_traffic() {
+            let filter = filter_program(9000, false);
+            // Final port check used to fall through into PASS.
+            assert_eq!(run(&filter, &ipv4_tcp(20, 6, 1234, 5678, 20)), DROP);
+            assert_eq!(run(&filter, &ipv4_tcp(20, 17, 9000, 40000, 20)), DROP);
+            // Truncated destination port: out-of-bounds load -> DROP.
+            let mut truncated = ipv4_tcp(20, 6, 1234, 40000, 20);
+            truncated.truncate(37);
+            assert_eq!(run(&filter, &truncated), DROP);
+        }
+
+        #[test]
+        fn filter_handles_arp_vlan_and_fragments() {
+            let mut arp = vec![0u8; 42];
+            arp[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+            assert_eq!(run(&filter_program(9000, false), &arp), DROP);
+            assert_eq!(run(&filter_program(9000, true), &arp), PASS);
+
+            let mut vlan = vec![0u8; 18];
+            vlan[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+            assert_eq!(run(&filter_program(9000, false), &vlan), PASS);
+
+            let mut fragment = ipv4_tcp(20, 6, 1111, 2222, 20);
+            fragment[20..22].copy_from_slice(&1u16.to_be_bytes()); // offset 8
+            assert_eq!(run(&filter_program(9000, false), &fragment), PASS);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 pub use platform::{run, target_down};
-
-/// Build and verify every packet type offline; no root and no network.
-pub fn selftest() -> std::io::Result<()> {
-    crate::packets::selftest()
-}
 
 #[cfg(not(target_os = "linux"))]
 pub fn run(_config: crate::Config) -> std::io::Result<()> {
